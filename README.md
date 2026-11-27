@@ -56,7 +56,7 @@ The package includes the five platform binaries, plugin manifest, Slack app mani
 2. Select **Create New App > From a manifest**.
 3. Choose your workspace and paste [`slack-app-manifest.yaml`](slack-app-manifest.yaml).
 4. Open **Basic Information > App-Level Tokens**.
-5. Generate a token with `connections:write`. This token starts with `xapp-`.
+5. Generate a token with `connections:write`. This token starts with `xapp-`, or `xoxe.xapp-` if the app has token rotation enabled (see [Apps with token rotation](#apps-with-token-rotation)).
 6. Install the app to your workspace.
 7. Copy the **Bot User OAuth Token** from **OAuth & Permissions**. This token starts with `xoxb-`.
 8. Enter both tokens in **Settings > Plugins > Slack**.
@@ -64,6 +64,22 @@ The package includes the five platform binaries, plugin manifest, Slack app mani
 10. Invite the bot to each channel that it must read with `/invite @Kandev`.
 
 Slack applies scope changes after you reinstall the app. The two tokens have different uses. The settings page reports which token needs attention.
+
+### Apps with token rotation
+
+Slack apps can issue rotating app-level tokens, which expire after 12 hours; Slack cannot turn this off for an app that uses it. Such an app-level token appears as an access token starting with `xoxe.xapp-` together with a refresh token starting with `xoxe-1-`. Enter:
+
+- the access token in **App-level token**,
+- the refresh token in **Token rotation: app-level refresh token**,
+- the **Client ID** and **Client Secret** from **Basic Information > App Credentials**.
+
+The plugin renews the access token before it expires, or as soon as Slack rejects it, and stores every new pair in its own encrypted secret. Each refresh token works once, so do not reuse a refresh token from these fields elsewhere. To start over, generate a new app-level token and paste the new pair.
+
+A refresh takes about a second. If Kandev stops the plugin in that second, for example because you save the plugin settings, Slack may have spent the old refresh token before the plugin stored the new one. The plugin then reports that the refresh token was already used; generate a new app-level token and paste the new pair.
+
+Uninstalling the plugin deletes its secrets, including the renewed pair. Once the plugin has renewed the token, the refresh token you pasted is spent, so after a reinstall generate a new app-level token and paste the new pair. Installing a newer package version over the existing plugin is an in-place upgrade and keeps the stored pair.
+
+Only the app-level token can rotate. Do not enable **Token Rotation** under **OAuth & Permissions** for this app: it makes the bot token rotate (it then starts with `xoxe.xoxb-`), which the plugin rejects. Use an app whose Bot User OAuth Token starts with `xoxb-`.
 
 ![Slack plugin settings](docs/settings.png)
 
@@ -110,13 +126,13 @@ The browser-session fallback uses a user session token and cookie. Treat both va
 
 | Problem | What to do |
 | --- | --- |
-| Socket Mode is not listening | Make sure that the app token starts with `xapp-`, has `connections:write`, and Slack Socket Mode is enabled. |
-| Slack rejects a token | Put the `xapp-` token in the app-level field and the `xoxb-` token in the bot field. |
+| Socket Mode is not listening | Make sure that the app token starts with `xapp-` (or `xoxe.xapp-` with its refresh token, Client ID and Client Secret for a rotating app), has `connections:write`, and Slack Socket Mode is enabled. |
+| Slack rejects a token | Put the `xapp-` or `xoxe.xapp-` token in the app-level field and the `xoxb-` token in the bot field. If a rotating token's refresh token was already used, generate a new app-level token and paste the new access and refresh pair. |
 | Slack reports a missing scope | Add the scope to the Slack app. Then reinstall the app. Save the new bot token if Slack issued one. |
 | The bot misses a mention | Invite it to the channel and make sure that the app manifest includes `app_mentions:read` and the needed history scopes. |
 | Fallback polling stops | Copy a new `xoxc-` token and `d` cookie from the same signed-in browser session. |
 | A task notification fails | Add `chat:write` and `im:write` to the Slack app. Then reinstall the app. Read the notification result before retrying. |
-| Kandev rejects a package as already installed | Uninstall the existing plugin before you install a local package with the same ID and version. |
+| Kandev rejects a package as already installed | Uninstall the existing plugin before you install a local package with the same ID and version. With a rotating app-level token, uninstalling deletes the renewed pair: generate a new app-level token and paste the new pair after reinstalling. |
 
 ## Develop and package
 

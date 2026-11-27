@@ -93,7 +93,7 @@ func OpenSocketConnection(ctx context.Context, appToken string) (string, error) 
 		// falling through to the generic bot-token advice.
 		var apiErr *apiError
 		if errors.As(err, &apiErr) {
-			return "", errors.New(explainAppTokenError(apiErr.Message))
+			return "", &appTokenError{code: apiErr.Message}
 		}
 		return "", err
 	}
@@ -103,10 +103,49 @@ func OpenSocketConnection(ctx context.Context, appToken string) (string, error) 
 	return resp.URL, nil
 }
 
+// appTokenError is a Slack rejection of the app-level token. It keeps the raw
+// code so the listener can tell an expired rotating token from a bad config.
+type appTokenError struct{ code string }
+
+func (e *appTokenError) Error() string { return explainAppTokenError(e.code) }
+
+// rejectionCode returns Slack's error code when err means Slack refused the
+// token itself, the case a refresh can recover from, and "" otherwise.
+func rejectionCode(err error) string {
+	var tokErr *appTokenError
+	if !errors.As(err, &tokErr) {
+		return ""
+	}
+	switch tokErr.code {
+	// not_authed means no credential arrived, which a new token cannot fix.
+	case "invalid_auth", "token_expired", "token_revoked":
+		return tokErr.code
+	}
+	return ""
+}
+
+// tokenProvider supplies the app-level token for each connection attempt.
+// After a rejection, rejected is the refused token and code Slack's error.
+type tokenProvider interface {
+	Token(ctx context.Context, rejected, code string) (string, error)
+	// Confirm records that token opened a connection; SaveProof stores
+	// that record without blocking Token.
+	Confirm(token string)
+	SaveProof(ctx context.Context)
+	// Renew exchanges the token ahead of expiry; the renewal worker calls
+	// it so reconnects never wait on an exchange.
+	Renew(ctx context.Context)
+	// Load publishes the stored token without an exchange.
+	Load(ctx context.Context)
+	// Reject records Slack calling token dead without an exchange.
+	Reject(ctx context.Context, token, code string)
+	Rotating() bool
+}
+
 // socketListener maintains the Socket Mode connection and hands each inbound
 // request to the shared triage path.
 type socketListener struct {
-	appToken string
+	tokens tokenProvider
 	// handle processes one request. It runs off the read loop so a slow
 	// triage — an agent call takes seconds — cannot delay the next ack.
 	handle func(context.Context, inboundRequest)
@@ -116,10 +155,36 @@ type socketListener struct {
 	// botUserID is the app's own user id, used to strip the leading mention
 	// from `@Kandev do the thing` and to ignore the app's own messages.
 	botUserID string
+	// renewNow wakes the renewal worker, which saves a token's proof once
+	// it opened a connection. Nil when the token does not rotate.
+	renewNow chan struct{}
+	// renewEvery overrides renewInterval in tests.
+	renewEvery time.Duration
 }
 
 // Run keeps a connection open until ctx is cancelled, redialling with backoff.
 func (l *socketListener) Run(ctx context.Context) {
+	if l.tokens.Rotating() {
+		// Before the worker starts, so its exchange never delays the first
+		// connection.
+		l.tokens.Load(ctx)
+		// Buffered and primed: the worker's first pass exchanges a pasted
+		// token right away to learn its expiry.
+		l.renewNow = make(chan struct{}, 1)
+		l.renewNow <- struct{}{}
+		// The worker is joined before returning, so a stopped listener can
+		// never finish a renewal after its replacement has started.
+		renewCtx, stopRenew := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			l.renew(renewCtx)
+		}()
+		defer func() {
+			stopRenew()
+			<-done
+		}()
+	}
 	backoff := reconnectFloor
 	for {
 		if ctx.Err() != nil {
@@ -149,6 +214,30 @@ func (l *socketListener) Run(ctx context.Context) {
 	}
 }
 
+// renew keeps a rotating token fresh while a connection stays open: Slack
+// only asks for the token again on reconnect, which may come after expiry.
+// It also runs right after a connection opens, to save the token's proof
+// without delaying the dial. Failures are logged by the provider and
+// surface on the next reconnect.
+func (l *socketListener) renew(ctx context.Context) {
+	every := l.renewEvery
+	if every == 0 {
+		every = renewInterval
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-l.renewNow:
+		}
+		l.tokens.Renew(ctx)
+		l.tokens.SaveProof(ctx)
+	}
+}
+
 func (l *socketListener) reportState(connected bool, err error) {
 	if l.onState != nil {
 		l.onState(connected, err)
@@ -158,7 +247,7 @@ func (l *socketListener) reportState(connected bool, err error) {
 // connectOnce opens one WebSocket and reads until it closes. A nil return
 // means Slack asked to cycle the connection, which is routine.
 func (l *socketListener) connectOnce(ctx context.Context) error {
-	url, err := OpenSocketConnection(ctx, l.appToken)
+	url, err := l.openConnection(ctx)
 	if err != nil {
 		return fmt.Errorf("open socket connection: %w", err)
 	}
@@ -182,6 +271,36 @@ func (l *socketListener) connectOnce(ctx context.Context) error {
 
 	l.reportState(true, nil)
 	return l.readLoop(ctx, conn)
+}
+
+// openConnection asks Slack for a socket URL. A rotating token that Slack
+// rejects is refreshed once and retried, which covers both an expired pasted
+// token and one that expired between scheduled refreshes.
+func (l *socketListener) openConnection(ctx context.Context) (string, error) {
+	token, err := l.tokens.Token(ctx, "", "")
+	if err != nil {
+		return "", err
+	}
+	url, err := OpenSocketConnection(ctx, token)
+	if code := rejectionCode(err); code != "" && l.tokens.Rotating() {
+		if token, err = l.tokens.Token(ctx, token, code); err != nil {
+			return "", err
+		}
+		url, err = OpenSocketConnection(ctx, token)
+		if code := rejectionCode(err); code != "" {
+			// One exchange per attempt; the next attempt must not resend
+			// a token Slack has called dead.
+			l.tokens.Reject(ctx, token, code)
+		}
+	}
+	if err == nil {
+		l.tokens.Confirm(token)
+		select {
+		case l.renewNow <- struct{}{}:
+		default:
+		}
+	}
+	return url, err
 }
 
 func (l *socketListener) readLoop(ctx context.Context, conn *websocket.Conn) error {

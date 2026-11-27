@@ -152,12 +152,15 @@ func TestLoadConfigRejectsIncoherentCredentials(t *testing.T) {
 // that was wanted, so naming the wrong one saves a round of guessing.
 func TestDescribeTokenNamesWhatWasPasted(t *testing.T) {
 	cases := map[string]string{
-		"xapp-1": "app-level token",
-		"xoxb-1": "bot token",
-		"xoxp-1": "user token",
-		"xoxc-1": "browser-session token",
-		"xoxe-1": "refresh token",
-		"nope":   "does not look like a Slack token",
+		"xapp-1":      "app-level token",
+		"xoxb-1":      "bot token",
+		"xoxp-1":      "user token",
+		"xoxe.xoxp-1": "rotating user token",
+		"xoxe.xoxb-1": "rotating bot token",
+		"xoxe.xapp-1": "rotating app-level access token",
+		"xoxc-1":      "browser-session token",
+		"xoxe-1":      "refresh token",
+		"nope":        "does not look like a Slack token",
 	}
 	for token, want := range cases {
 		if got := describeToken(token); !strings.Contains(got, want) {

@@ -48,6 +48,9 @@ type supervisor struct {
 	socketUp   bool
 	socketErr  string
 	socketSeen bool
+	// tokens is the running listener's app-token source, read for rotation
+	// warnings shown alongside a working connection.
+	tokens *appTokenSource
 }
 
 func newSupervisor(host func() pluginsdk.Host) *supervisor {
@@ -97,7 +100,7 @@ func (s *supervisor) tick(ctx context.Context, force bool) {
 		return
 	}
 	if cfg.Mode == authModeApp {
-		s.ensureSocket(ctx, cfg)
+		s.ensureSocket(ctx, host, cfg)
 		s.publishSocketStatus(ctx, host, cfg)
 		return
 	}
@@ -107,7 +110,7 @@ func (s *supervisor) tick(ctx context.Context, force bool) {
 
 // ensureSocket starts the Socket Mode listener, restarting it when the
 // credentials change.
-func (s *supervisor) ensureSocket(ctx context.Context, cfg *config) {
+func (s *supervisor) ensureSocket(ctx context.Context, host pluginsdk.Host, cfg *config) {
 	fingerprint := credentialFingerprint(cfg)
 	s.mu.Lock()
 	if s.active == fingerprint && s.cancel != nil {
@@ -128,8 +131,15 @@ func (s *supervisor) ensureSocket(ctx context.Context, cfg *config) {
 	}
 
 	sourceCtx, cancel := context.WithCancel(ctx)
+	tokens := newAppTokenSource(cfg, host)
+	if s.tokens != nil && s.tokens.sameChain(tokens) {
+		// Restarted for another credential change: keep the old source,
+		// which may hold a renewed pair the vault has not accepted yet.
+		s.tokens.adopt(tokens)
+		tokens = s.tokens
+	}
 	listener := &socketListener{
-		appToken:  cfg.AppToken,
+		tokens:    tokens,
 		botUserID: botUserID,
 		handle: func(reqCtx context.Context, req inboundRequest) {
 			// Already acknowledged to Slack; the error is recorded on the
@@ -141,6 +151,7 @@ func (s *supervisor) ensureSocket(ctx context.Context, cfg *config) {
 	s.mu.Lock()
 	s.active = fingerprint
 	s.cancel = cancel
+	s.tokens = tokens
 	s.mu.Unlock()
 
 	s.wg.Add(1)
@@ -178,9 +189,23 @@ func (s *supervisor) stopSource() {
 // plugin page shows whether events are actually arriving.
 func (s *supervisor) publishSocketStatus(ctx context.Context, host pluginsdk.Host, cfg *config) {
 	s.mu.Lock()
-	up, seen, socketErr := s.socketUp, s.socketSeen, s.socketErr
+	up, seen, socketErr, tokens := s.socketUp, s.socketSeen, s.socketErr, s.tokens
 	s.mu.Unlock()
-	if !seen {
+	if tokens != nil {
+		// Shown even while disconnected: an unsaved pair is exactly what an
+		// operator restarting to troubleshoot needs to know about. A renewal
+		// failure the listener already reported is not repeated.
+		switch w := tokens.WarningBesides(socketErr); {
+		case w == "":
+		case socketErr == "":
+			socketErr = w
+		default:
+			socketErr += " (also: " + w + ")"
+		}
+	}
+	if !seen && socketErr == "" {
+		// No connection result yet; only a rotation warning is worth
+		// showing, and up is false until the listener reports.
 		return
 	}
 	st := readStatus(ctx, host)
@@ -346,11 +371,14 @@ func (s *supervisor) ensureProbed(ctx context.Context, cl *client, cfg *config, 
 // lengths and the last few characters are used: enough to notice a rotation,
 // never enough to reconstruct a secret if it reaches a log.
 func credentialFingerprint(cfg *config) string {
-	return fmt.Sprintf("%s|%d:%s|%d:%s|%d:%s",
+	return fmt.Sprintf("%s|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s",
 		cfg.Mode,
 		len(cfg.AppToken), tail(cfg.AppToken),
 		len(cfg.BotToken), tail(cfg.BotToken),
-		len(cfg.SessionToken), tail(cfg.SessionToken))
+		len(cfg.SessionToken), tail(cfg.SessionToken),
+		len(cfg.AppRefreshToken), tail(cfg.AppRefreshToken),
+		len(cfg.ClientID), tail(cfg.ClientID),
+		len(cfg.ClientSecret), tail(cfg.ClientSecret))
 }
 
 func tail(s string) string {

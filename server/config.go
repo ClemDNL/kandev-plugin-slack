@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -62,10 +63,17 @@ const (
 type config struct {
 	Mode authMode
 
-	// AppToken (xapp-) opens the Socket Mode WebSocket; BotToken (xoxb-) is
-	// used for every Web API call and is the identity replies come from.
+	// AppToken (xapp-, or xoxe.xapp- when token rotation is on) opens the
+	// Socket Mode WebSocket; BotToken (xoxb-) is used for every Web API call
+	// and is the identity replies come from.
 	AppToken string
 	BotToken string
+
+	// AppRefreshToken (xoxe-) with ClientID and ClientSecret lets the plugin
+	// renew an app-level token from a Slack app with token rotation enabled.
+	AppRefreshToken string
+	ClientID        string
+	ClientSecret    string
 
 	// SessionToken (xoxc-) and SessionCookie (`d`) are the fallback pair.
 	SessionToken  string
@@ -105,15 +113,18 @@ var errNotConfigured = errors.New("slack plugin is not configured")
 // combinations form a coherent install path.
 func loadConfig(raw map[string]any) (*config, error) {
 	cfg := &config{
-		AppToken:      strings.TrimSpace(configString(raw, "app_token")),
-		BotToken:      strings.TrimSpace(configString(raw, "bot_token")),
-		SessionToken:  strings.TrimSpace(configString(raw, "session_token")),
-		SessionCookie: strings.TrimSpace(configString(raw, "session_cookie")),
-		CommandPrefix: strings.TrimSpace(configString(raw, "command_prefix")),
-		Channels:      parseChannels(configString(raw, "channels")),
-		PollInterval:  pollInterval(raw),
-		StartAgent:    configBool(raw, "start_agent"),
-		UtilityAgent:  strings.TrimSpace(configString(raw, "utility_agent")),
+		AppToken:        strings.TrimSpace(configString(raw, "app_token")),
+		BotToken:        strings.TrimSpace(configString(raw, "bot_token")),
+		AppRefreshToken: strings.TrimSpace(configString(raw, "app_refresh_token")),
+		ClientID:        strings.TrimSpace(configString(raw, "client_id")),
+		ClientSecret:    strings.TrimSpace(configString(raw, "client_secret")),
+		SessionToken:    strings.TrimSpace(configString(raw, "session_token")),
+		SessionCookie:   strings.TrimSpace(configString(raw, "session_cookie")),
+		CommandPrefix:   strings.TrimSpace(configString(raw, "command_prefix")),
+		Channels:        parseChannels(configString(raw, "channels")),
+		PollInterval:    pollInterval(raw),
+		StartAgent:      configBool(raw, "start_agent"),
+		UtilityAgent:    strings.TrimSpace(configString(raw, "utility_agent")),
 	}
 	if cfg.CommandPrefix == "" {
 		cfg.CommandPrefix = defaultCommandPrefix
@@ -134,8 +145,11 @@ func loadConfig(raw map[string]any) (*config, error) {
 // the fallback because a stale cookie is still saved would be a confusing way
 // to lose real-time events.
 func detectMode(cfg *config) (authMode, error) {
-	hasApp := cfg.AppToken != "" || cfg.BotToken != ""
 	hasSession := cfg.SessionToken != "" || cfg.SessionCookie != ""
+	// A refresh token alone selects the app (it can bootstrap the access
+	// token) only when no fallback field is filled; otherwise it is a
+	// leftover and the fallback's own validation names what is missing.
+	hasApp := cfg.AppToken != "" || cfg.BotToken != "" || (cfg.AppRefreshToken != "" && !hasSession)
 	switch {
 	case hasApp:
 		return authModeApp, nil
@@ -160,20 +174,72 @@ func (c *config) validate() error {
 // are easy to swap, so a wrong-prefix value is named rather than left to fail
 // as an opaque Slack rejection later.
 func (c *config) validateApp() error {
-	if c.AppToken == "" {
+	if c.AppToken == "" && c.AppRefreshToken == "" {
 		return errors.New("a Slack app needs its app-level token too — create one with the connections:write scope under Basic Information > App-Level Tokens")
 	}
 	if c.BotToken == "" {
 		return errors.New("a Slack app needs its bot token too — copy the Bot User OAuth Token from OAuth & Permissions after installing the app")
 	}
-	if !strings.HasPrefix(c.AppToken, appTokenPrefix) {
-		return fmt.Errorf("the app-level token must start with %q — %s", appTokenPrefix, describeToken(c.AppToken))
+	if c.AppToken != "" && !strings.HasPrefix(c.AppToken, appTokenPrefix) && !strings.HasPrefix(c.AppToken, rotatingAppTokenPrefix) {
+		return fmt.Errorf("the app-level token must start with %q (or %q when token rotation is on) — %s", appTokenPrefix, rotatingAppTokenPrefix, describeToken(c.AppToken))
+	}
+	if strings.HasPrefix(c.BotToken, rotatingBotTokenPrefix) {
+		return errors.New("this bot token rotates, which the plugin does not support — paste a static xoxb- Bot User OAuth Token. Token rotation cannot be turned off for an app, so an app that only issues rotating bot tokens needs replacing with one created without rotation")
 	}
 	if !strings.HasPrefix(c.BotToken, botTokenPrefix) {
 		return fmt.Errorf("the bot token must start with %q — %s", botTokenPrefix, describeToken(c.BotToken))
 	}
+	return c.validateRotation()
+}
+
+// rotatesAppToken reports whether the app-level token comes from a Slack app
+// with token rotation on. A static xapp- token always wins: leftover rotation
+// fields from an earlier setup must not resurrect a stored rotating chain.
+func (c *config) rotatesAppToken() bool {
+	if strings.HasPrefix(c.AppToken, appTokenPrefix) {
+		return false
+	}
+	return strings.HasPrefix(c.AppToken, rotatingAppTokenPrefix) || c.AppRefreshToken != ""
+}
+
+// validateRotation checks the token-rotation fields. A rotating access token
+// expires within 12 hours, so it is only usable together with its refresh
+// token and the client credentials that authorize the refresh.
+func (c *config) validateRotation() error {
+	if !c.rotatesAppToken() {
+		return nil
+	}
+	if c.AppRefreshToken == "" {
+		return errors.New("this app-level token rotates and expires — also paste its refresh token (xoxe-1-…), shown next to it when it was generated, plus the Client ID and Client Secret from Basic Information")
+	}
+	if !strings.HasPrefix(c.AppRefreshToken, refreshTokenPrefix) {
+		return fmt.Errorf("the app-level refresh token must start with %q — %s", refreshTokenPrefix, describeToken(c.AppRefreshToken))
+	}
+	if c.ClientID == "" || c.ClientSecret == "" {
+		return errors.New("refreshing a rotating app-level token needs the app's Client ID and Client Secret from Basic Information > App Credentials")
+	}
+	if !clientIDPattern.MatchString(c.ClientID) {
+		// Client ID is not a secret field, and the host stores the settings
+		// before the plugin reads them, so a credential pasted into it is
+		// already saved in plain text; this can only tell the operator to
+		// replace it.
+		if clientSecretPattern.MatchString(c.ClientID) {
+			return errors.New("the Client ID looks like the Client Secret — the Client ID is the dotted number above it under Basic Information > App Credentials; also regenerate the Client Secret there, since this one was saved in a non-secret field")
+		}
+		if kind := describeToken(c.ClientID); kind != notASlackToken {
+			return errors.New("the Client ID field holds a Slack token (" + kind + ") — it was saved in a non-secret field, so revoke or regenerate that token, and enter the dotted Client ID from Basic Information > App Credentials instead")
+		}
+		return errors.New("the Client ID must be the dotted number (such as 1234567890.1234567890) from Basic Information > App Credentials")
+	}
 	return nil
 }
+
+var (
+	// clientIDPattern matches a Slack app's Client ID.
+	clientIDPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
+	// clientSecretPattern matches a Slack app's Client Secret.
+	clientSecretPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+)
 
 func (c *config) validateSession() error {
 	if c.SessionToken == "" {
@@ -194,12 +260,18 @@ func (c *config) validateSession() error {
 // Slack's documented token prefixes. Kept as constants because the same
 // strings appear in validation, detection, and operator-facing errors.
 const (
-	appTokenPrefix     = "xapp-"
-	botTokenPrefix     = "xoxb-"
-	userTokenPrefix    = "xoxp-"
-	sessionTokenPrefix = "xoxc-"
-	refreshTokenPrefix = "xoxe-"
+	appTokenPrefix          = "xapp-"
+	rotatingAppTokenPrefix  = "xoxe.xapp-"
+	botTokenPrefix          = "xoxb-"
+	rotatingBotTokenPrefix  = "xoxe.xoxb-"
+	userTokenPrefix         = "xoxp-"
+	rotatingUserTokenPrefix = "xoxe.xoxp-"
+	sessionTokenPrefix      = "xoxc-"
+	refreshTokenPrefix      = "xoxe-"
 )
+
+// notASlackToken is describeToken's answer for a value with no Slack prefix.
+const notASlackToken = "this does not look like a Slack token"
 
 // describeToken names what the operator actually pasted. Every one of these is
 // reachable from the same Slack app page as the token that was wanted, so
@@ -208,16 +280,22 @@ func describeToken(token string) string {
 	switch {
 	case strings.HasPrefix(token, appTokenPrefix):
 		return "this is an app-level token"
+	case strings.HasPrefix(token, rotatingAppTokenPrefix):
+		return "this is a rotating app-level access token"
 	case strings.HasPrefix(token, botTokenPrefix):
 		return "this is a bot token"
+	case strings.HasPrefix(token, rotatingBotTokenPrefix):
+		return "this is a rotating bot token"
 	case strings.HasPrefix(token, userTokenPrefix):
 		return "this is a user token; this plugin uses the bot token instead"
+	case strings.HasPrefix(token, rotatingUserTokenPrefix):
+		return "this is a rotating user token; this plugin uses the bot token instead"
 	case strings.HasPrefix(token, sessionTokenPrefix):
 		return "this is a browser-session token; it belongs in the fallback fields"
 	case strings.HasPrefix(token, refreshTokenPrefix):
 		return "this is a refresh token, not an access token"
 	default:
-		return "this does not look like a Slack token"
+		return notASlackToken
 	}
 }
 

@@ -93,7 +93,21 @@ config_schema:
       type: string
       secret: true
       title: "App-level token"
-      description: "xapp- token from Basic Information > App-Level Tokens, with the connections:write scope. Opens the Socket Mode connection so Slack can push events without Kandev needing a public URL."
+      description: "xapp- token from Basic Information > App-Level Tokens, with the connections:write scope. Opens the Socket Mode connection so Slack can push events without Kandev needing a public URL. Apps with token rotation enabled issue an xoxe.xapp- access token instead; paste it here and fill in the three token-rotation fields below."
+    app_refresh_token:
+      type: string
+      secret: true
+      title: "Token rotation: app-level refresh token"
+      description: "Only for Slack apps with token rotation enabled. The xoxe-1- refresh token shown next to the app-level access token when it was generated. The plugin renews the access token before it expires and stores each new pair itself. Paste a new pair here to restart the chain."
+    client_id:
+      type: string
+      title: "Token rotation: Client ID"
+      description: "Only for Slack apps with token rotation enabled. Basic Information > App Credentials > Client ID. Authorizes the token refresh."
+    client_secret:
+      type: string
+      secret: true
+      title: "Token rotation: Client Secret"
+      description: "Only for Slack apps with token rotation enabled. Basic Information > App Credentials > Client Secret. Authorizes the token refresh."
     bot_token:
       type: string
       secret: true
